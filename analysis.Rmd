@@ -1,0 +1,302 @@
+---
+title: 'Взаимосвязи в компании: отчет'
+author: "Подолин Дмитрий, dpodolin"
+output: 
+  html_document:
+    code_folding: hide
+---
+
+```{r}
+library(tidytext) # обработка текста
+library(ggplot2) # графики
+library(wordcloud2) # облака слов
+library(tidyr) # переформатирование таблиц (длинный - широкий формат, например)
+library(stringr) # обработка строк (удаление, поиск, замена символов)
+library(dplyr) # преобразование данных
+library(ggraph)
+```
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Загрузка данных
+
+```{r message = F}
+library(igraphdata)
+library(igraph)
+data(enron) 
+library(lubridate)
+source("~/shared/minor2_2023/2-tm-net/hw/personalTask2.R")
+# если у вас выдает ошибку для такой загрузки -- замените файл на personalTask2.R (см.ниже)
+#source("~/shared/minor2_2023/2-tm-net/hw/personalTask2.R")
+start_date = hw_net_get_start_date()
+# определяем конечную точку месяца
+last_date = start_date + dmonths(1)
+time = as_date(as_datetime(E(enron)$Time))
+# убираем вершины раньше начальной точки и позже конечной
+net = enron %>% delete_edges(E(enron)[time < start_date | time > last_date])
+# убираем связи вершины самой с собой (согласно данным, иногда люди себя в копию ставят)
+net = igraph::simplify(net, remove.multiple = F)
+# убираем обособленные вершины
+net = net %>% delete_vertices(V(net)[degree(net) == 0])
+```
+
+Анализируются данные с `r start_date` по `r last_date`
+
+## Описание сети
+
+Для начала посмотрим на саму сеть: на ее составляющие - атрибуты, которые присущи как вершинам, так и ребрам, чтобы понимать с чем мы можем здесь работать. Еще им номера присвоим для удобства.
+```{r}
+vertex_numbers <- 1:vcount(net)  # Создаем вектор с номерами для каждой вершины - на всякий случай
+V(net)$id <- vertex_numbers
+
+# Получение атрибутов вершин в виде data.frame
+vertex_attrs <- get.data.frame(net, what = "vertices")
+
+# Получение атрибутов ребер в виде data.frame
+edge_attrs <- get.data.frame(net, what = "edges")
+
+
+```
+Попытаемся её каким то образом визуализировать:
+```{r}
+g = net
+plotlayout <- ggraph::create_layout(g, "fr")  
+
+# Визуализация сети с подходящим стилизованным графом
+ggraph(g, layout = plotlayout) + 
+  geom_edge_link() + 
+  geom_node_point() + 
+  theme_void()
+```
+Никакого существенного вывода отсюда не извлечь, кроме как, разве что, вывод о том что, визуально, вроде как здесь нет большого разделения на отдельные комьюнити. Проверим это позже.
+
+
+### Выявление значимых вершин
+
+**Использованные меры центральности: **
+
+```{r}
+degree(net) #про количество связей у каждой вершины
+
+#ВТОРОЕ - ПРО БИТВИННОСТЬ - логика, что если такую вершину убрать, то двигаться большинству придется дольше, чтобы добраться из А в Б
+betweenness(net)
+
+#ТРЕТЬЕ - ПРО БЛИЖАЙШАЯ КО ВСЕМ ВЕРШИНА
+closeness(net)  
+
+```
+Попытка нарисовать сеть с акцентом на центральности у меня всё крашит, поэтому рассмотрим параметр - вершины с макимальным параметром одной из трех метрик центральности:
+```{r}
+degree_cent = degree(net)
+betweenness_cent = betweenness(net)
+closeness_cent = closeness(net)
+clean_closeness_values <- na.omit(closeness_cent)
+
+# Нахождение узла с наибольшими значениями центральности
+max_degree_node <- which(degree_cent == max(degree_cent))
+max_betweenness_node <- which(betweenness_cent == max(betweenness_cent))
+max_closeness_node <- which(clean_closeness_values == max(clean_closeness_values))
+
+# Вывод результатов
+print(paste0("Node with the maximum degree centrality: ", max_degree_node))
+print(paste0("Node with the maximum betweenness centrality: ", max_betweenness_node))
+print(paste0("Node with the maximum closeness centrality: ", max_closeness_node))
+```
+
+Отсюда можно сделать некоторые выводы:
+
+1)Глобальная доступность: Это указывает на то, что в сети существует группа вершин, которые имеют близкое расположение ко всем другим вершинам. Эти вершины могут играть ключевую роль в обеспечении глобальной связности и доступности информации в сети.
+
+2)Важность локальной связности: Высокое количество вершин с максимальным значением центральности по близости также может указывать на важность локальных сообществ или подсетей в сети. Вершинам с высокой центральностью близости может требоваться меньше шагов, чтобы достичь других вершин внутри их локальных сообществ, что может быть важно для распространения информации и влияния внутри этих сообществ.
+
+### Выявление сообществ
+
+**Использованные меры выделения сообществ: **
+
+```{r}
+#1 алгоритм edge.betweenness
+comm1 = edge.betweenness.community(net)
+membership(comm1)
+plot(comm1,net) 
+modularity(comm1)
+
+#2 алгоритм - walktrap
+comm3 = walktrap.community(net)
+membership(comm3)
+plot(comm3,net)
+modularity(comm3)
+
+```
+По значению modularity видно, что разбиение по алгоритму walktrap более точное, поэтому в дальнейшем буду часто к нему обращатся.
+```{r}
+plot(comm3,net,vertex.label=NA,vertex.size=0.01,edge.arrow.size = 0, edge = 0, vertex = 0)
+```
+
+### Исследовательские вопросы
+
+**Вопрос 1: Посмотрим на вершины - людей которые связывают отдельные комьюнити в наибольшей степени - мосты**
+
+Посмторим на мосты согласно самому точному из двух алгоритмов разбиения на коммъюнити(согласно метрике - modularity) - алгоритм - walktrap.
+```{r}
+library(igraph)
+g <- net
+
+# Разбиваем граф на сообщества с использованием метода walktrap
+walktrap_communities <- walktrap.community(g)
+
+# Находим вершины-мосты в графе
+find_bridges <- function(graph) {
+  # Используем метод edge_betwenness для вычисления центральности ребер
+  edge_betweenness_values <- edge_betweenness(graph)
+  
+  # Плучаем рёбра с самой большой центральностью
+  max_betweenness_edges <- which(edge_betweenness_values == max(edge_betweenness_values))
+  
+  # Получаем вершины, соответствующие выбранным рёбрам
+  bridges <- ends(graph, E(graph)[max_betweenness_edges])
+  
+  return(unique(bridges))  # Возвращаем уникальные вершины-мосты
+}
+
+# Вызываем функцию для нахождения вершин-мостов в графе
+graph_bridges1 <- find_bridges(g)
+```
+Далее посмторим на мосты, но согласно другому алгоритму разбиения на коммъюнити - betweenness
+```{r}
+library(igraph)
+g <- net
+
+# Разбиваем граф на сообщества с использованием метода walktrap
+walktrap_communities <- walktrap.community(g)
+
+# Находим вершины-мосты в графе на основе центральности ребер (betweenness)
+find_bridges <- function(graph) {
+  # Используем метод edge_betweenness для вычисления центральности ребер
+  edge_betweenness_values <- edge_betweenness(graph)
+  
+  # Получаем рёбра с наибольшей центральностью (betweenness)
+  max_betweenness_edges <- which(edge_betweenness_values == max(edge_betweenness_values))
+  
+  # Получаем вершины, соответствующие выбранным рёбрам
+  bridges <- ends(graph, E(graph)[max_betweenness_edges])
+  
+  return(unique(bridges))  # Возвращаем уникальные вершины-мосты
+}
+
+# Вызываем функцию для нахождения вершин-мостов на основе центральности рёбер (betweenness)
+graph_bridges2 <- find_bridges(g)
+```
+Видно что в обоих случаях мостами являются вершины 6 и 67.
+```{r}
+vertex_attrs %>% filter(id == "6" | id == "67")
+```
+Вот два важных человека для всей компании по следующим причинам:
+
+1)Проводники информации: Люди-мосты часто выступают в роли носителей информации между разными группами. Они могут передавать и распространять идеи, знания и ценности от одного сообщества к другому, что способствует распространению информации и расширению горизонтов.
+
+2)Сохранение целостности сети: Люди-мосты играют важную роль в поддержании целостности социальной сети. Благодаря своим связям с различными сообществами они способствуют сохранению связности и разнообразия всей сети.
+
+3)Социальная интеграция: Люди-мосты способствуют социальной интеграции, поскольку связывают людей из разных сред и культур. Они могут стать катализаторами для сближения и взаимопонимания между различными группами.
+
+
+
+
+**Вопрос 2: Влияет ли одинаковая должность на формирование связей между сотрудниками **
+
+```{r}
+
+g = net
+
+#посмотрим на наше значение ассортативности
+assortativity_real = assortativity_nominal(g,as.factor(V(g)$Note), directed = T)
+
+#проведем тест ассортативности - случайные связи
+number_of_permutations = 2000
+assortativity_shuffled  <- rep(NA, number_of_permutations)
+for(i in 1:number_of_permutations){
+  V(g)$attr_shuffled = sample(V(g)$Note, replace = F) 
+  assortativity_shuffled[i] = assortativity_nominal(g,as.factor(V(g)$attr_shuffled), directed = T)}
+result <- assortativity_nominal(net, as.factor(V(net)$Note))
+print(result)
+
+q <- quantile(assortativity_shuffled, c(0.05, 0.95))
+
+odn_pvalue = sum(assortativity_shuffled <= assortativity_real) / number_of_permutations
+odn_pvalue
+
+```
+
+Мы получили односторонний p-value равный 0.94, значит наша нулевая гипотеза о том что нет влияния должности сотрудника на формирование связей посредством сообщений e-mail - оправдана.
+
+
+
+
+## Место сотрудника в сети
+
+```{r}
+hw_net_get_vertex(net) #"Lawrence May"
+vertex_attrs %>% filter(Name == "Lawrence May")
+
+
+```
+Мне достался "Lawrence May": имейл - larry.may; должность(note) - Director; его номер - 85
+Сравним его центральность относительно средней величины центральности всего графа(по 2 метрикам).
+```{r}
+#Просчеты
+a = mean(degree(net))
+
+b = mean(betweenness(net))
+
+c = degree(net)[85]
+
+d = betweenness(net)[85]
+
+# Установка и загрузка библиотек
+library(ggplot2)
+
+# Предположим, у вас есть данные по значениям центральности
+specific_node_centralities <- c(a, b)    # Значения центральности для выбранной вершины
+average_centralities <- c(c, d)           # Средние значения центральности для сравнения
+
+# Создание dataframe для построения гистограммы
+data <- data.frame(
+  Metric = c("Metric degree", "Metric betweenness"),
+  Lawrence_May = specific_node_centralities,
+  Average = average_centralities
+)
+
+# Преобразование данных в длинный формат для ggplot
+data_long <- tidyr::gather(data, key = "Variable", value = "Value", -Metric)
+
+# Построение гистограммы с парами столбцов
+ggplot(data_long, aes(x = Metric, y = Value, fill = Variable)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(title = "Comparison of Centralities",
+       x = "Metric", y = "Centralities") +
+  theme_minimal()
+
+```
+Отсюда видно, что сотрудник Lawrence May занимает важное место в сети и с ним лучше дружить!!!!!!
+
+
+Посмотрим какому коммъюнити принадлежит Lawrence May.
+```{r}
+membership(comm3)[85]#увидели что принадлежит коммъюнити 3
+
+qq = unlist(comm3[3])
+length(qq) #увидели что в нем всего 9 человек.
+
+vertex_attrs %>% filter(vertex_attrs$id %in% qq)#смотрим на людей из его коммъюнити согласно алгоритму walktrap
+```
+Теперь мы знаем теоретических друзей, близких коллег или просто собеседников, которые влияют на нашего Lawrence May в большей мере(и наоборот соответсвенно). Значит мы например через них можем косвенно влияет на Lawrence May в наших корыстных целях.
+
+## Общие выводы
+Мною был проведен сетевой анализ некоторой организации, в результате которого я совершил:
+1)Сотрудников с наибольшими мерами центральности по трем метрикам - важные узлы для взаимодействия внутри компании.
+2)Выявил сообщества людей внутри компании по 2 разным метрикам, предпочел одну из них в силу ее большей точности, а в результате имею понимание принципа деления на группы внутри сообщества - важная информация, открывающая доступ к юольшому количеству возможных махинаций с сотрудниками.
+3)Обнаружил, исходя из двух метрик, 2 человек - связывающих большее количество сообществ, и подробно сформулировал пользу от полученной информации - смотреть выше перед вторым вопросом.
+4)Определил что наличие одинаковых должностей не влияет на формирование связей внутри компании, что означает например отсутсвие сговора между нижайшем персоналом против верхушки(а почему бы и нет:) ) 
+5)На конкретного человека разыскал его сообщество, членов его сообщества, выяснил значимость его в сети(через меры центральности) а значит и внутри сообщества тоже.
